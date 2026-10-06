@@ -39,14 +39,16 @@ def background_at(yy: np.ndarray, xx: np.ndarray) -> np.ndarray:
     return np.clip(rad, 0.0, 1.0)
 
 
-def background() -> np.ndarray:
+def background(h: int = H, w: int = W) -> np.ndarray:
     """Reference-viewport background radiance (world coords = viewport)."""
-    yy, xx = np.indices((H, W))
+    yy, xx = np.indices((h, w))
     return background_at(yy, xx)
 
 
-def scene(rect: tuple[int, int, int, int]) -> np.ndarray:
-    rad = background()
+def scene(
+    rect: tuple[int, int, int, int], h: int = H, w: int = W
+) -> np.ndarray:
+    rad = background(h, w)
     t, l, b, r = rect
     rad[t:b, l:r, :] = 0.12  # moving object (unsheared even at 2.0 s)
     rad[2:7, 44:51, :] = 1.0  # clipped highlight: saturates on long exposure
@@ -60,16 +62,19 @@ def render(rad: np.ndarray, exposure: float) -> np.ndarray:
 
 
 def _padded_scene(
-    rect: tuple[int, int, int, int], shift: tuple[int, int]
+    rect: tuple[int, int, int, int],
+    shift: tuple[int, int],
+    h: int = H,
+    w: int = W,
 ) -> np.ndarray:
-    """Scene on an (H+2M) x (W+2M) canvas, padded with background so a
+    """Scene on an (h+2M) x (w+2M) canvas, padded with background so a
     shifted camera always sees real scene content (black padding would be
     indistinguishable from clipping). The moving rectangle is placed at this
     frame's viewport coordinates *rect* (it moves between frames); the
     highlight is a fixed world-space feature."""
     m = 8
     dy, dx = shift
-    wyy, wxx = np.indices((H + 2 * m, W + 2 * m))
+    wyy, wxx = np.indices((h + 2 * m, w + 2 * m))
     wyy -= m
     wxx -= m
     big = background_at(wyy, wxx)
@@ -79,21 +84,32 @@ def _padded_scene(
     return big
 
 
-def make_frames() -> list[np.ndarray]:
-    """Return 3 shifted digital frames.
+def make_frames(
+    shifts: list[tuple[int, int]] | None = None,
+    rects: list[tuple[int, int, int, int]] | None = None,
+    exposures: list[float] | None = None,
+    h: int = H,
+    w: int = W,
+) -> list[np.ndarray]:
+    """Return shifted digital frames.
 
-    Frame i shows the padded scene shifted by ``-SHIFTS[i]`` so that warping
-    by ``SHIFTS[i]`` (source pixel -> reference coords s + shift) aligns its
-    static background with the reference viewport.
+    Frame i shows the padded scene shifted by ``-shifts[i]`` so that warping
+    by ``shifts[i]`` (source pixel -> reference coords s + shift) aligns its
+    static background with the reference viewport.  ``shifts`` / ``rects`` /
+    ``exposures`` default to the module-level 3-frame stack; ``h`` / ``w``
+    allow non-tile-multiple sizes.
     """
+    shifts = SHIFTS if shifts is None else shifts
+    rects = RECTS if rects is None else rects
+    exposures = EXPOSURES if exposures is None else exposures
     frames = []
     m = 8
-    for (dy, dx), rect in zip(SHIFTS, RECTS):
-        big = _padded_scene(rect, (dy, dx))
+    for (dy, dx), rect in zip(shifts, rects):
+        big = _padded_scene(rect, (dy, dx), h, w)
         # Frame pixel s = reference pixel t - shift, so the frame's viewport
         # window into the padded scene starts at margin + shift.
-        view = big[m + dy : m + dy + H, m + dx : m + dx + W]
-        frames.append(render(view, EXPOSURES[len(frames)]))
+        view = big[m + dy : m + dy + h, m + dx : m + dx + w]
+        frames.append(render(view, exposures[len(frames)]))
     return frames
 
 
@@ -108,8 +124,13 @@ def request_payload(
     exposures: list[float] | None = None,
     reference_index: int = REF_INDEX,
     tolerance: float = 0.05,
+    h: int = H,
+    w: int = W,
+    shifts: list[tuple[int, int]] | None = None,
+    rects: list[tuple[int, int, int, int]] | None = None,
 ) -> dict:
-    frames = frames if frames is not None else make_frames()
+    if frames is None:
+        frames = make_frames(shifts=shifts, rects=rects, exposures=exposures, h=h, w=w)
     exposures = exposures if exposures is not None else list(EXPOSURES)
     return {
         "frames": [{"image_base64": encode_png_b64(f)} for f in frames],

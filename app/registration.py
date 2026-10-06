@@ -12,6 +12,14 @@ result, because the majority static-background tiles dominate the median.
 Clipped samples (any channel 0 / 65535) are masked out before scoring, and
 flat tiles (gradient at rounding-noise level) are ignored, so saturation or
 uniform regions never anchor the shift.
+
+Images whose sides are not a multiple of the tile size get *partial* edge
+tiles: the remainder rows/columns form their own tiles with real ids (never a
+sentinel), so the edge strip takes part in texture screening and shift
+scoring.  Each tile's coverage bar is derived from its own sampled-pixel
+capacity, and the same tile grid / thresholds are used for the zero-shift
+baseline and every candidate shift; samples outside the frame overlap are
+never counted.
 """
 from __future__ import annotations
 
@@ -110,27 +118,29 @@ def register_frame(
     """
     h, w = ref_valid.shape
     tile, stride = _pick_layout(h, w)
-    nh, nw = h // tile, w // tile
+    # Ceil division: remainder rows/columns form their own (smaller) edge
+    # tiles with regular ids, so every pixel belongs to exactly one tile and
+    # the edge strip participates in registration instead of being dropped.
+    nh = (h + tile - 1) // tile
+    nw = (w + tile - 1) // tile
     n_tiles = nh * nw
 
     base = np.arange(n_tiles, dtype=np.int32).reshape(nh, nw)
-    ids_full = np.repeat(np.repeat(base, tile, axis=0), tile, axis=1)
-    if ids_full.shape[0] < h:
-        pad_h = h - ids_full.shape[0]
-        ids_full = np.vstack(
-            [ids_full, np.full((pad_h, ids_full.shape[1]), -1, np.int32)]
-        )
-    if ids_full.shape[1] < w:
-        pad_w = w - ids_full.shape[1]
-        ids_full = np.hstack(
-            [ids_full, np.full((ids_full.shape[0], pad_w), -1, np.int32)]
-        )
+    ids_full = np.repeat(np.repeat(base, tile, axis=0), tile, axis=1)[:h, :w]
 
     texture = _tile_texture(ref_rad, ref_valid, ids_full, n_tiles)
 
-    # Samples expected inside one fully-covered, sampled tile.
-    per_tile = (tile // stride) ** 2
-    min_pairs = max(3, int(np.ceil(MIN_TILE_COVERAGE * per_tile)))
+    # Per-tile coverage bar: the sampled-pixel capacity of each tile on the
+    # zero-shift stride grid.  Full tiles hold (tile // stride)**2 samples;
+    # partial edge tiles hold proportionally fewer and get a proportionally
+    # lower bar, so coverage is judged against the samples a tile can
+    # actually contribute.  The same bar gates tile eligibility (zero-shift
+    # baseline) and every candidate shift below, keeping the valid-pixel
+    # domain consistent across all scores.
+    capacity = np.bincount(
+        ids_full[::stride, ::stride].ravel(), minlength=n_tiles
+    ).astype(np.float64)
+    min_pairs = np.maximum(3.0, np.ceil(MIN_TILE_COVERAGE * capacity))
     # 16-bit quantization + float32 rounding allowance (radiance units) for
     # the two shortest exposures involved. Every agreement test gets this even
     # when the user tolerance is 0: it is below one full 16-bit level at the

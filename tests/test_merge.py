@@ -34,6 +34,63 @@ def test_registration_recovers_true_shifts_not_dragged_by_mover():
     assert shifts == [(3, -5), (0, 0), (-4, 6)]
 
 
+def test_registration_boundary_shifts_at_max():
+    # Shifts exactly at the +-8 px limit must still be recovered.
+    shifts = [(8, -8), (0, 0), (-8, 8)]
+    payload = syn.request_payload(shifts=shifts, rects=[syn.RECTS[0]] * 3)
+    frames = [decode_frame_png(f["image_base64"]) for f in payload["frames"]]
+    _, _, _, got = merge_stack(
+        frames, payload["exposure_seconds"], 1, payload["tolerance"]
+    )
+    assert got == shifts
+
+
+def test_registration_nine_frames():
+    shifts = [
+        (8, 8), (5, -7), (3, 0), (0, 0), (-2, 5),
+        (-8, -8), (6, 2), (-4, -6), (1, 7),
+    ]
+    exposures = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 0.6]
+    payload = syn.request_payload(
+        shifts=shifts,
+        rects=[syn.RECTS[0]] * 9,
+        exposures=exposures,
+        reference_index=3,
+    )
+    frames = [decode_frame_png(f["image_base64"]) for f in payload["frames"]]
+    _, _, _, got = merge_stack(frames, exposures, 3, payload["tolerance"])
+    assert got == shifts
+
+
+def test_registration_non_tile_multiple_size():
+    # 50x64: 8-px tiles leave a 2-row remainder strip. It must form its own
+    # partial tiles and take part in registration (previously the strip was
+    # labeled -1: its texture leaked into the last tile's statistics and the
+    # per-shift bincount raised an uncaught ValueError).
+    _, _, _, shifts = run_merge(h=50, w=64)
+    assert shifts == [(3, -5), (0, 0), (-4, 6)]
+
+
+def test_non_tile_multiple_remainder_strip_is_fused():
+    result, motion, unknown, _ = run_merge(h=50, w=64)
+    bg = syn.background(h=50, w=64)
+    # The 2 remainder rows are covered by the reference and frame 0 (frame
+    # 2's -4-row shift misses them): static, known, and fused to the true
+    # background radiance.
+    strip = np.zeros((50, 64), bool)
+    strip[48:50, 2:58] = True
+    static_known = strip & ~motion & ~unknown
+    assert static_known.sum() > 60
+    err = np.abs(result - bg.astype(np.float32)).max(axis=2)
+    assert np.median(err[static_known]) < 0.01
+
+
+def test_registration_non_tile_multiple_both_axes():
+    # Remainder strips on both axes (53x62 -> 5 extra rows, 6 extra cols).
+    _, _, _, shifts = run_merge(h=53, w=62)
+    assert shifts == [(3, -5), (0, 0), (-4, 6)]
+
+
 def test_static_background_fuses_to_scene_radiance():
     result, motion, unknown, _ = run_merge()
     bg = syn.background()
@@ -242,6 +299,31 @@ def test_http_registration_failure_returns_422():
     payload = syn.request_payload()
     rng = np.random.default_rng(1)
     garbage = rng.integers(100, 60000, (syn.H, syn.W, 3), np.uint16)
+    payload["frames"][0]["image_base64"] = syn.encode_png_b64(garbage)
+    resp = _post(payload)
+    assert resp.status_code == 422
+    assert "registration failed" in resp.json()["error"]
+
+
+def test_http_merge_non_tile_multiple_size_ok():
+    payload = syn.request_payload(h=50, w=64)
+    resp = _post(payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["shifts"] == [[3, -5], [0, 0], [-4, 6]]
+    assert data["width"] == 64 and data["height"] == 50
+    tiff = base64.b64decode(data["radiance_tiff_base64"])
+    arr = cv2.imdecode(np.frombuffer(tiff, np.uint8), cv2.IMREAD_UNCHANGED)
+    assert arr is not None
+    assert arr.dtype == np.float32 and arr.shape == (50, 64, 3)
+
+
+def test_http_non_tile_multiple_registration_failure_returns_422():
+    # Unregistrable non-tile-multiple input must be a 422 MergeError, never
+    # an uncaught 500.
+    payload = syn.request_payload(h=50, w=64)
+    rng = np.random.default_rng(2)
+    garbage = rng.integers(100, 60000, (50, 64, 3), np.uint16)
     payload["frames"][0]["image_base64"] = syn.encode_png_b64(garbage)
     resp = _post(payload)
     assert resp.status_code == 422
