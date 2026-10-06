@@ -103,6 +103,75 @@ def encode_png_b64(img: np.ndarray) -> str:
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
+# --------------------- size-parametrized scene builders --------------------
+
+
+def background_at_sized(
+    h: int, w: int, yy: np.ndarray, xx: np.ndarray
+) -> np.ndarray:
+    """Static background for arbitrary viewport sizes (same recipe as above)."""
+    yy = np.asarray(yy, dtype=np.float64)
+    xx = np.asarray(xx, dtype=np.float64)
+    rad = np.empty(yy.shape + (3,), dtype=np.float64)
+    rad[..., 0] = 0.30 + 0.003 * yy
+    rad[..., 1] = 0.25 + 0.003 * xx
+    rad[..., 2] = 0.35 + 0.001 * (yy + xx)
+    checker = (((yy // 8).astype(int) + (xx // 8).astype(int)) % 2)
+    rad += checker[..., None] * 0.10
+    return np.clip(rad, 0.0, 1.0)
+
+
+def make_frames_sized(
+    h: int,
+    w: int,
+    shifts: list[tuple[int, int]],
+    exposures: list[float],
+    rects: list[tuple[int, int, int, int] | None] | None = None,
+    highlight: bool = True,
+) -> list[np.ndarray]:
+    """Build shifted digital frames at any (h, w), including sizes that are
+    not multiples of the registration tile (e.g. 50x64 with 8 px tiles)."""
+    m = 8
+    wyy, wxx = np.indices((h + 2 * m, w + 2 * m))
+    wyy = wyy - m
+    wxx = wxx - m
+    base_bg = background_at_sized(h, w, wyy, wxx)
+    frames = []
+    for i, (dy, dx) in enumerate(shifts):
+        big = base_bg.copy()
+        if rects is not None and rects[i] is not None:
+            t, l, b, r = rects[i]
+            big[m + dy + t : m + dy + b, m + dx + l : m + dx + r, :] = 0.12
+        if highlight:
+            big[m + 2 : m + 7, m + 44 : m + 51, :] = 1.0
+        view = big[m + dy : m + dy + h, m + dx : m + dx + w]
+        frames.append(
+            np.clip(np.rint(view * exposures[i] * 65535.0), 0, 65535).astype(
+                np.uint16
+            )
+        )
+    return frames
+
+
+def request_payload_sized(
+    h: int,
+    w: int,
+    shifts: list[tuple[int, int]],
+    exposures: list[float],
+    reference_index: int,
+    tolerance: float = 0.05,
+    rects: list[tuple[int, int, int, int] | None] | None = None,
+    highlight: bool = True,
+) -> dict:
+    frames = make_frames_sized(h, w, shifts, exposures, rects, highlight)
+    return {
+        "frames": [{"image_base64": encode_png_b64(f)} for f in frames],
+        "exposure_seconds": list(exposures),
+        "reference_index": reference_index,
+        "tolerance": tolerance,
+    }
+
+
 def request_payload(
     frames: list[np.ndarray] | None = None,
     exposures: list[float] | None = None,

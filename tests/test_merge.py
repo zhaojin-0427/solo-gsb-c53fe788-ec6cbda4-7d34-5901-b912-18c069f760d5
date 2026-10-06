@@ -170,6 +170,119 @@ def test_8bit_png_rejected():
         decode_frame_png(base64.b64encode(buf).decode())
 
 
+# ---------------- non-tile-multiple sizes (50x64 with 8 px tiles) ----------
+
+
+def test_tile_layout_partial_edge_tiles():
+    from app.registration import _pick_layout, _tile_capacities, _tile_ids
+
+    tile, stride = _pick_layout(50, 64)
+    assert tile == 8 and stride == 1
+    ids, nh, nw = _tile_ids(50, 64, tile)
+    # ceil grid: 7 rows of 8 px + one partial row of 2 px; 8 px columns.
+    assert (nh, nw) == (7, 8)
+    assert ids.shape == (50, 64)
+    # No -1 padding: every in-frame pixel belongs to a real tile, ids are
+    # contiguous and the last row tiles are exactly the partial ones.
+    assert ids.min() == 0 and ids.max() == nh * nw - 1
+    assert set(np.unique(ids).tolist()) == set(range(nh * nw))
+    assert np.all(ids[48:50, :] == np.repeat(np.arange(48, 56), 8)[None, :])
+    assert np.all(ids[:8, :8] == 0)
+    # Capacities: 8x8 sampled interior tiles hold 64 stride-1 positions; the
+    # 2x8 partial edge tiles hold only 16.
+    cap = _tile_capacities(50, 64, nh, nw, tile, stride)
+    assert cap.shape == (56,)
+    assert np.all(cap[:48] == 64)
+    assert np.all(cap[48:] == 16)
+    # And capacity matches the actual stride-sampled positions of every tile.
+    sampled = np.bincount(ids[::stride, ::stride].ravel(), minlength=nh * nw)
+    assert np.array_equal(sampled, cap)
+
+
+def test_nontile_multiple_registration_recovers_shifts():
+    # The original bug: 50x64 with 8 px tiles leaves 2 rows padded with -1;
+    # they wrapped into the last tile's texture stats and made np.bincount
+    # raise an uncaught ValueError instead of registering or a 422 MergeError.
+    shifts = [(3, -5), (0, 0), (-4, 6)]
+    exposures = [0.25, 1.0, 2.0]
+    frames = syn.make_frames_sized(50, 64, shifts, exposures, highlight=False)
+    result, motion, unknown, got = merge_stack(
+        frames, exposures, 1, 0.05
+    )
+    assert got == shifts
+    assert motion.sum() == 0 and unknown.sum() == 0
+    bg = syn.background_at_sized(50, 64, *np.indices((50, 64)))
+    err = np.abs(result - bg.astype(np.float32)).max(axis=2)
+    assert np.median(err) < 0.01
+
+
+def test_nontile_multiple_with_mover_and_border_shifts():
+    shifts = [(8, -8), (0, 0), (-8, 8)]
+    exposures = [0.25, 1.0, 2.0]
+    rects = [
+        (8, 10, 18, 22),
+        (8, 10, 18, 22),
+        (26, 36, 36, 48),
+    ]
+    frames = syn.make_frames_sized(
+        50, 63, shifts, exposures, rects=rects, highlight=False
+    )
+    _, motion, unknown, got = merge_stack(frames, exposures, 1, 0.05)
+    assert got == shifts  # +/-8 boundary shifts on both non-multiple axes
+    # Frame 2's mover in its own coords maps to ref (18..27, 44..55); the
+    # clipped columns 55..62 miss frame 2, so only the in-frame core is motion.
+    assert motion[20:26, 45:53].mean() > 0.9
+    assert motion[9:16, 11:20].mean() > 0.9
+    assert unknown.sum() == 0
+
+
+def test_partial_edge_rows_anchor_registration():
+    """Texture living only in the 2-row partial edge band must register.
+
+    With the old -1 padding those rows were excluded (and corrupted the last
+    full tiles); here they are the *only* textured rows, so registration can
+    succeed only if the partial edge tiles participate on equal footing.
+    """
+    h, w = 50, 64
+    m = 8
+    # Positive shifts keep the bottom edge band visible in every frame's
+    # viewport; a negative shift would geometrically miss it.
+    shifts = [(6, 0), (4, 0), (0, 0)]
+    exposures = [0.3, 0.4, 0.25]
+    # One fixed world-space stripe shared by every frame (rng outside loop).
+    stripe = 0.25 + 0.35 * np.random.default_rng(3).random(w)
+    frames = []
+    for dy, exp in zip([s[0] for s in shifts], exposures):
+        big = np.full((h + 2 * m, w + 2 * m, 3), 0.30, np.float64)
+        big[h - 2 + m : h + m, m : m + w, :] = stripe[None, :, None]
+        view = big[m + dy : m + dy + h, m : m + w]
+        frames.append(
+            np.clip(np.rint(view * exp * 65535.0), 1, 65534).astype(np.uint16)
+        )
+    _, motion, unknown, got = merge_stack(frames, exposures, 2, 0.02)
+    assert got == shifts
+    assert motion.sum() == 0 and unknown.sum() == 0
+
+
+def test_nontile_multiple_garbage_frame_returns_merge_error():
+    # An unrelated frame must surface as MergeError (HTTP 422), never the raw
+    # np.bincount ValueError the -1 padding used to trigger.
+    shifts = [(3, -5), (0, 0), (-4, 6)]
+    frames = syn.make_frames_sized(
+        50, 64, shifts, [0.25, 1.0, 2.0], highlight=False
+    )
+    rng = np.random.default_rng(11)
+    frames[0] = rng.integers(100, 60000, (50, 64, 3), np.uint16)
+    with pytest.raises(MergeError, match="registration failed"):
+        merge_stack(frames, [0.25, 1.0, 2.0], 1, 0.05)
+
+
+def test_nontile_multiple_flat_frames_returns_merge_error():
+    flat = [np.full((50, 64, 3), 30000, np.uint16) for _ in range(3)]
+    with pytest.raises(MergeError, match="texture|registration"):
+        merge_stack(flat, [0.25, 1.0, 2.0], 1, 0.05)
+
+
 # ----------------------------- HTTP layer --------------------------------
 
 
@@ -208,6 +321,30 @@ def test_http_merge_ok_decodes_roundtrip():
     )
     assert set(np.unique(motion_png)).issubset({0, 255})
     assert (motion_png > 0).sum() > 0
+
+
+def test_http_nontile_multiple_merge_ok():
+    # 50x64 PNGs (8 px tiles leave a 2-row partial edge band) must merge end
+    # to end through the HTTP layer instead of 500-ing on np.bincount.
+    payload = syn.request_payload_sized(
+        50,
+        64,
+        shifts=[(3, -5), (0, 0), (-4, 6)],
+        exposures=[0.25, 1.0, 2.0],
+        reference_index=1,
+        highlight=False,
+    )
+    resp = _post(payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["shifts"] == [[3, -5], [0, 0], [-4, 6]]
+    assert data["width"] == 64 and data["height"] == 50
+
+    tiff = base64.b64decode(data["radiance_tiff_base64"])
+    arr = cv2.imdecode(np.frombuffer(tiff, np.uint8), cv2.IMREAD_UNCHANGED)
+    assert arr is not None
+    assert arr.dtype == np.float32 and arr.shape == (50, 64, 3)
+    assert np.isfinite(arr).all()
 
 
 def test_http_invalid_exposure_returns_422():

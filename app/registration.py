@@ -9,6 +9,12 @@ tolerance*.  The per-tile fractions are combined by their median: a minority of
 tiles covered by the moving object (or by clipped highlights) cannot pull the
 result, because the majority static-background tiles dominate the median.
 
+The tile grid is ``ceil(h/tile)`` by ``ceil(w/tile)``: edge tiles may be
+partially sized (sides need not divide by tile) and take part like any other
+tile.  A tile counts for a shift only while it keeps a minimum fraction of its
+own in-frame, unclipped, stride-sampled samples, so out-of-frame pixels are
+never scored.
+
 Clipped samples (any channel 0 / 65535) are masked out before scoring, and
 flat tiles (gradient at rounding-noise level) are ignored, so saturation or
 uniform regions never anchor the shift.
@@ -57,6 +63,8 @@ def _pick_layout(h: int, w: int) -> tuple[int, int]:
     tile = 1
     # After a shift of up to MAX_SHIFT px the usable grid is the interior
     # (nh*tile - 2*MAX_SHIFT) by (nw*tile - 2*MAX_SHIFT); keep >= 4x4 there.
+    # Floor division is deliberate: the count must be guaranteed by *full*
+    # tiles; partial edge tiles (see register_frame) are a bonus on top.
     for s in _TILE_SIZES:
         nh, nw = h // s, w // s
         if nh * s - 2 * MAX_SHIFT >= 4 * s and nw * s - 2 * MAX_SHIFT >= 4 * s:
@@ -68,6 +76,40 @@ def _pick_layout(h: int, w: int) -> tuple[int, int]:
             stride = st
             break
     return tile, stride
+
+
+def _tile_ids(h: int, w: int, tile: int) -> tuple[np.ndarray, int, int]:
+    """Tile id of every pixel on a ceil(h/tile) x ceil(w/tile) grid.
+
+    Edge tiles may be smaller than ``tile`` (when a side is not a multiple of
+    tile); every in-frame pixel still belongs to exactly one tile, so partial
+    edges take part in registration. Returns ``(ids HxW int32, nh, nw)``.
+    """
+    nh = (h + tile - 1) // tile
+    nw = (w + tile - 1) // tile
+    base = np.arange(nh * nw, dtype=np.int32).reshape(nh, nw)
+    # (length - 1) // tile is exactly ceil(length / tile) - 1, so these stay
+    # in range for both divisible and non-divisible lengths (no -1 padding).
+    row_tile = (np.arange(h, dtype=np.int32) // tile)
+    col_tile = (np.arange(w, dtype=np.int32) // tile)
+    ids = base[row_tile[:, None], col_tile[None, :]]
+    return ids, nh, nw
+
+
+def _tile_capacities(
+    h: int, w: int, nh: int, nw: int, tile: int, stride: int
+) -> np.ndarray:
+    """Stride-sampled in-tile positions (geometric capacity) per tile.
+
+    Edge tiles can be shorter/narrower than ``tile``; tile starts are
+    multiples of ``tile`` (hence of ``stride``), so the sampled count of a
+    tile spanning ``[start, end)`` is ``ceil((end - start) / stride)``.
+    """
+    starts_r = tile * np.arange(nh)
+    starts_c = tile * np.arange(nw)
+    nr = (np.minimum(starts_r + tile, h) - starts_r + stride - 1) // stride
+    nc = (np.minimum(starts_c + tile, w) - starts_c + stride - 1) // stride
+    return (nr[:, None] * nc[None, :]).ravel().astype(np.int64)
 
 
 def _tile_texture(
@@ -110,27 +152,19 @@ def register_frame(
     """
     h, w = ref_valid.shape
     tile, stride = _pick_layout(h, w)
-    nh, nw = h // tile, w // tile
+    ids_full, nh, nw = _tile_ids(h, w, tile)
     n_tiles = nh * nw
-
-    base = np.arange(n_tiles, dtype=np.int32).reshape(nh, nw)
-    ids_full = np.repeat(np.repeat(base, tile, axis=0), tile, axis=1)
-    if ids_full.shape[0] < h:
-        pad_h = h - ids_full.shape[0]
-        ids_full = np.vstack(
-            [ids_full, np.full((pad_h, ids_full.shape[1]), -1, np.int32)]
-        )
-    if ids_full.shape[1] < w:
-        pad_w = w - ids_full.shape[1]
-        ids_full = np.hstack(
-            [ids_full, np.full((ids_full.shape[0], pad_w), -1, np.int32)]
-        )
 
     texture = _tile_texture(ref_rad, ref_valid, ids_full, n_tiles)
 
-    # Samples expected inside one fully-covered, sampled tile.
-    per_tile = (tile // stride) ** 2
-    min_pairs = max(3, int(np.ceil(MIN_TILE_COVERAGE * per_tile)))
+    # Comparable samples expected in one tile at zero shift.  Edge tiles may
+    # be partial (sides not divisible by tile), so capacities differ; a tile
+    # counts for a shift once it retains at least MIN_TILE_COVERAGE of its
+    # own stride-sampled positions, with the same >= 3 absolute floor.
+    capacity = _tile_capacities(h, w, nh, nw, tile, stride)
+    min_pairs = np.maximum(3, np.ceil(MIN_TILE_COVERAGE * capacity)).astype(
+        np.int64
+    )
     # 16-bit quantization + float32 rounding allowance (radiance units) for
     # the two shortest exposures involved. Every agreement test gets this even
     # when the user tolerance is 0: it is below one full 16-bit level at the
